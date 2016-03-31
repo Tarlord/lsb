@@ -8,6 +8,9 @@ import click
 # TODO: process error with twitch api
 # TODO: check somehow if livestreamer is available
 # TODO: think about stream info output!
+# TODO: Add search
+# TODO: Make multi-resolution display
+# TODO: Random stream select feature
 
 @click.command()
 @click.option('-g', '--game', default='', help='Load streams for specific game')
