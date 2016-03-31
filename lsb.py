@@ -2,7 +2,12 @@ from urllib2 import urlopen
 from urllib import urlencode
 from json import loads
 from subprocess import Popen
+from pprint import pprint
 import click
+
+# TODO: process error with twitch api
+# TODO: check somehow if livestreamer is available
+# TODO: think about stream info output!
 
 @click.command()
 @click.option('-g', '--game', default='', help='Load streams for specific game')
@@ -17,22 +22,24 @@ def main(game, limit, top, quality):
     else:
         click.echo("Top twitch.tv streams right now:")
         click.echo("\n".join(map(makeStreamInfoString, enumerate(streams))))
-        click.confirm('Want to watch something?', abort=True)
+        # click.confirm('Want to watch something?', abort=True)
         streamNum = click.prompt('Type stream number to start livestreamer', type=click.IntRange(1, len(streams)))
     Popen(['livestreamer', streams[int(streamNum) - 1]["channel"]["url"], quality])
 
 def makeStreamInfoString(streamEnum):
     (i, stream) = streamEnum
+    pprint(stream["channel"])
     channelName = stream["channel"]["name"] or "?" * 8
     channelStatus = stream["channel"]["status"] or "?" * 8
     game = stream["game"] or "?" * 8
     viewers = str(stream["viewers"])
-    return u"[{:02d}] {} || {} viewers on {} || {}".format(
+    return u"[{:02d}] {:-^30} {:+^20} {: ^40} {}".format(
         i + 1,
-        channelStatus,
-        click.style(viewers, bold=True),
         click.style(channelName, bold=True),
-        click.style(game, bold=True)
+        click.style(viewers, bold=True),
+        click.style(game, bold=True),
+        channelStatus
+
     )
 
 if __name__ == '__main__':
