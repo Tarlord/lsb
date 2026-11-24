@@ -1,8 +1,15 @@
 // Merge-queue bot: one pass over every open PR labelled `queue`.
-// Order: when the label was added. A PR is merged when its `test` check is
-// green on a head that is up to date with the base; when it is behind, the bot
-// updates the branch, re-runs Test and waits. GitHub's branch rules still decide
-// whether each merge is allowed: the bot has no bypass.
+//
+// Rules:
+// 1. A PR is in the queue only while it has the label AND `test` is green on its head.
+//    Its position is the moment both became true (later of label time and test finish).
+// 2. A red `test` or a conflict keeps the label: the PR waits for a fix (one comment
+//    per commit) and rejoins at the back when `test` is green again.
+// 3. The label can be added at any time; a PR whose test is still running is silent
+//    until the test finishes.
+// The first PR in the queue is merged when it is up to date with the base; if it is
+// behind, the bot updates the branch (label `queue:active`) and waits for the new test.
+// GitHub's branch rules still decide whether each merge is allowed: the bot has no bypass.
 
 const API = process.env.GITHUB_API_URL || 'https://api.github.com'
 const REPO = process.env.GITHUB_REPOSITORY
@@ -11,11 +18,12 @@ const DRY_RUN = process.env.DRY_RUN === 'true'
 const RUN_URL = process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_SERVER_URL}/${REPO}/actions/runs/${process.env.GITHUB_RUN_ID}` : ''
 
 const LABEL = 'queue'
-const ACTIVE = 'queue:active' // the one PR the bot is bringing up to date
+const ACTIVE = 'queue:active'
 const CHECK = 'test'
 const TEST_WORKFLOW = 'test.yml'
 const STATUS = 'merge-queue'
 const MAX_MERGES_PER_PASS = 10
+const MISSING_TEST_GRACE_MS = 3 * 60 * 1000
 const WRITE_ROLES = new Set(['admin', 'maintain', 'write'])
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -58,12 +66,19 @@ const removeLabel = (number, name) => write(`remove "${name}" from #${number}`, 
 const addLabel = (number, name) => write(`add "${name}" to #${number}`,
   () => gh('POST', `/repos/${REPO}/issues/${number}/labels`, { labels: [name] }))
 
-async function setStatus (sha, state, description) {
+async function lastStatus (sha) {
   const statuses = await gh('GET', `/repos/${REPO}/commits/${sha}/statuses?per_page=100`)
-  const last = statuses.find(status => status.context === STATUS)
-  if (last?.state === state && last?.description === description) return
-  await write(`status ${short(sha)}: ${state} "${description}"`, () =>
-    gh('POST', `/repos/${REPO}/statuses/${sha}`, { state, context: STATUS, description: description.slice(0, 140), ...(RUN_URL ? { target_url: RUN_URL } : {}) }))
+  return statuses.find(status => status.context === STATUS)
+}
+
+// Returns true when the status changed (used to comment once per commit and state).
+async function setStatus (sha, state, description) {
+  const text = description.slice(0, 140)
+  const last = await lastStatus(sha)
+  if (last?.state === state && last?.description === text) return false
+  await write(`status ${short(sha)}: ${state} "${text}"`, () =>
+    gh('POST', `/repos/${REPO}/statuses/${sha}`, { state, context: STATUS, description: text, ...(RUN_URL ? { target_url: RUN_URL } : {}) }))
+  return true
 }
 
 // Latest `queue` label event: when and by whom.
@@ -88,15 +103,16 @@ async function canWrite (login) {
   }
 }
 
-// `test` check on a commit: green | red | pending | missing.
+// `test` check on a commit: green | red | pending | missing, with its finish time.
 async function testState (sha) {
   const { check_runs: runs } = await gh('GET', `/repos/${REPO}/commits/${sha}/check-runs?check_name=${CHECK}&filter=latest&per_page=100`)
   const run = runs.sort((a, b) => b.id - a.id)[0]
   if (!run) return { state: 'missing' }
-  if (run.status !== 'completed') return { state: 'pending', url: run.html_url }
-  if (run.conclusion === 'success') return { state: 'green', url: run.html_url }
-  if (run.conclusion === 'cancelled') return { state: 'missing', url: run.html_url }
-  return { state: 'red', url: run.html_url, conclusion: run.conclusion }
+  const base = { url: run.html_url, completedAt: run.completed_at }
+  if (run.status !== 'completed') return { state: 'pending', ...base }
+  if (run.conclusion === 'success') return { state: 'green', ...base }
+  if (run.conclusion === 'cancelled') return { state: 'missing', ...base }
+  return { state: 'red', ...base }
 }
 
 // mergeable_state is computed lazily; poll briefly until GitHub has it.
@@ -104,50 +120,59 @@ async function freshPr (number) {
   let pr
   for (let attempt = 0; attempt < 6; attempt++) {
     pr = await gh('GET', `/repos/${REPO}/pulls/${number}`)
-    if (pr.mergeable !== null && pr.mergeable_state !== 'unknown') return pr
+    if (pr.state !== 'open' || (pr.mergeable !== null && pr.mergeable_state !== 'unknown')) return pr
     await sleep(2000)
   }
   return pr
 }
 
-async function dequeue (entry, reason) {
-  const { number, head } = entry.pr
-  await removeLabel(number, LABEL)
-  await removeLabel(number, ACTIVE)
-  await setStatus(head.sha, 'failure', `Removed from queue: ${reason}`)
-  await comment(number, `Removed from the merge queue: ${reason}.\n\nFix it and add the \`${LABEL}\` label again.`)
+// Not mergeable for now: keep the label, comment once per commit, let the next PR go.
+async function waitForFix (pr, reason, hint) {
+  await removeLabel(pr.number, ACTIVE)
+  const changed = await setStatus(pr.head.sha, 'failure', `Waiting for a fix: ${reason}`)
+  if (changed) await comment(pr.number, `Merge queue: ${reason} on ${short(pr.head.sha)}. ${hint}\n\nThe PR keeps its \`${LABEL}\` label and rejoins the queue when \`${CHECK}\` is green again.`)
 }
+
+const testFailed = (pr, test) => waitForFix(pr, `\`${CHECK}\` failed`, `See ${test.url}.`)
+const conflicted = pr => waitForFix(pr, `conflicts with \`${pr.base.ref}\``, `Merge \`${pr.base.ref}\` into the branch and resolve the conflict.`)
 
 async function readQueue (base) {
   const issues = await gh('GET', `/repos/${REPO}/issues?state=open&labels=${encodeURIComponent(LABEL)}&per_page=100`)
-  const entries = []
-  for (const issue of issues.filter(item => item.pull_request)) {
-    const event = await labelEvent(issue.number)
-    entries.push({
-      pr: await gh('GET', `/repos/${REPO}/pulls/${issue.number}`),
-      labeledAt: event?.created_at || issue.created_at,
-      labeledBy: event?.actor?.login,
-      active: issue.labels.some(label => label.name === ACTIVE)
-    })
-  }
-  entries.sort((a, b) => a.labeledAt.localeCompare(b.labeledAt) || a.pr.number - b.pr.number)
-
   const queue = []
-  for (const entry of entries) {
-    const { pr } = entry
-    let reason = null
-    if (pr.base.ref !== base) reason = `it targets \`${pr.base.ref}\`, the queue only merges into \`${base}\``
-    else if (pr.head.repo?.full_name !== REPO) reason = 'PRs from forks are not supported'
-    else if (!(await canWrite(entry.labeledBy))) reason = `the label was added by \`${entry.labeledBy || 'unknown'}\`, who has no write access`
-    if (reason) { await dequeue(entry, reason); continue }
-    entry.test = await testState(pr.head.sha)
-    if (entry.test.state === 'red') { await dequeue(entry, `\`${CHECK}\` failed on ${short(pr.head.sha)} (${entry.test.url})`); continue }
-    queue.push(entry)
+  for (const issue of issues.filter(item => item.pull_request)) {
+    // The issues search lags behind merges and label removals: trust the PR itself.
+    const pr = await gh('GET', `/repos/${REPO}/pulls/${issue.number}`)
+    if (pr.state !== 'open' || !pr.labels.some(label => label.name === LABEL)) continue
+    const event = await labelEvent(pr.number)
+    if (pr.base.ref !== base || pr.head.repo?.full_name !== REPO || !(await canWrite(event?.actor?.login))) {
+      const reason = pr.base.ref !== base
+        ? `it targets \`${pr.base.ref}\`; the queue only merges into \`${base}\``
+        : pr.head.repo?.full_name !== REPO ? 'PRs from forks are not supported' : `the label was added by \`${event?.actor?.login || 'unknown'}\`, who has no write access`
+      await removeLabel(pr.number, LABEL)
+      await removeLabel(pr.number, ACTIVE)
+      await comment(pr.number, `Removed from the merge queue: ${reason}.`)
+      continue
+    }
+    const active = pr.labels.some(label => label.name === ACTIVE)
+    const test = await testState(pr.head.sha)
+    if (test.state === 'red') { await testFailed(pr, test); continue }
+    // A commit that conflicted only rejoins with a new commit (a re-run cannot fix it).
+    const last = await lastStatus(pr.head.sha)
+    if (last?.state === 'failure' && last.description.includes('conflicts')) continue
+    if (pr.draft || test.state !== 'green') {
+      // Labelled but not eligible yet: silent, unless it is the PR being brought up to date.
+      if (active) queue.push({ pr, test, active, since: '' })
+      continue
+    }
+    const labeledAt = event?.created_at || issue.created_at
+    const since = labeledAt > test.completedAt ? labeledAt : test.completedAt
+    queue.push({ pr, test, active, since })
   }
+  // The active PR keeps its turn; the rest go by the moment they became eligible.
+  queue.sort((a, b) => (b.active - a.active) || a.since.localeCompare(b.since) || a.pr.number - b.pr.number)
   return queue
 }
 
-// A leftover `queue:active` on a PR that left the queue would block nothing, but clean it up.
 async function clearStaleActive () {
   const issues = await gh('GET', `/repos/${REPO}/issues?state=all&labels=${encodeURIComponent(ACTIVE)}&per_page=100`)
   for (const issue of issues) {
@@ -155,55 +180,38 @@ async function clearStaleActive () {
   }
 }
 
-async function dispatchTest (pr, previousSha) {
-  // update-branch is asynchronous: wait until the new head exists before dispatching.
-  let current = pr
-  for (let attempt = 0; attempt < 15 && current.head.sha === previousSha; attempt++) {
-    await sleep(2000)
-    current = await gh('GET', `/repos/${REPO}/pulls/${pr.number}`)
-  }
-  if (current.head.sha === previousSha) { console.log(`#${pr.number}: head not updated yet; next pass dispatches Test`); return }
-  await write(`dispatch ${TEST_WORKFLOW} on ${current.head.ref} (${short(current.head.sha)})`,
-    () => gh('POST', `/repos/${REPO}/actions/workflows/${TEST_WORKFLOW}/dispatches`, { ref: current.head.ref }))
-  await setStatus(current.head.sha, 'pending', 'Next to merge: testing on the updated branch')
+// The update-branch push normally starts Test by itself; dispatch only when no run showed up.
+async function ensureTestRuns (pr) {
+  const { commit } = await gh('GET', `/repos/${REPO}/commits/${pr.head.sha}`)
+  const age = Date.now() - Date.parse(commit.committer.date)
+  if (age < MISSING_TEST_GRACE_MS) return
+  await write(`dispatch ${TEST_WORKFLOW} on ${pr.head.ref} (${short(pr.head.sha)})`,
+    () => gh('POST', `/repos/${REPO}/actions/workflows/${TEST_WORKFLOW}/dispatches`, { ref: pr.head.ref }))
 }
 
-// Returns true when the PR was merged.
+// Returns 'merged', 'waiting' (this PR holds the turn) or 'skip' (let the next PR go).
 async function advance (entry) {
   const pr = await freshPr(entry.pr.number)
   const { number } = pr
-  if (pr.state !== 'open') return false
+  if (pr.state !== 'open') return 'skip'
   if (pr.draft) {
-    if (entry.active) await removeLabel(number, ACTIVE)
-    await setStatus(pr.head.sha, 'pending', 'In queue: waiting for the PR to be ready for review')
-    return false
+    await removeLabel(number, ACTIVE)
+    return 'skip'
   }
-  if (pr.mergeable_state === 'dirty' || pr.mergeable === false) {
-    await dequeue({ pr }, `it conflicts with \`${pr.base.ref}\``)
-    return false
-  }
+  if (pr.mergeable_state === 'dirty' || pr.mergeable === false) { await conflicted(pr); return 'skip' }
   if (pr.mergeable_state === 'behind') {
     if (!entry.active) await addLabel(number, ACTIVE)
     await write(`update #${number} with ${pr.base.ref}`, () =>
       gh('PUT', `/repos/${REPO}/pulls/${number}/update-branch`, { expected_head_sha: pr.head.sha }))
-    if (!DRY_RUN) await dispatchTest(pr, pr.head.sha)
-    return false
+    await setStatus(pr.head.sha, 'pending', `Next to merge: updated with ${pr.base.ref}, testing again`)
+    return 'waiting'
   }
   const test = await testState(pr.head.sha)
-  if (test.state === 'missing') {
-    if (!entry.active) await addLabel(number, ACTIVE)
-    await write(`dispatch ${TEST_WORKFLOW} on ${pr.head.ref} (${short(pr.head.sha)})`,
-      () => gh('POST', `/repos/${REPO}/actions/workflows/${TEST_WORKFLOW}/dispatches`, { ref: pr.head.ref }))
-    await setStatus(pr.head.sha, 'pending', 'Next to merge: testing')
-    return false
-  }
+  if (test.state === 'red') { await testFailed(pr, test); return 'skip' }
+  if (test.state === 'missing') { await ensureTestRuns(pr); return 'waiting' }
   if (test.state === 'pending') {
     await setStatus(pr.head.sha, 'pending', 'Next to merge: waiting for test')
-    return false
-  }
-  if (test.state === 'red') {
-    await dequeue({ pr }, `\`${CHECK}\` failed on ${short(pr.head.sha)} (${test.url})`)
-    return false
+    return 'waiting'
   }
   try {
     await write(`merge #${number} at ${short(pr.head.sha)}`, () =>
@@ -213,32 +221,30 @@ async function advance (entry) {
     if (error.status === 405 || error.status === 409) {
       console.log(`#${number}: merge refused (${error.message}); retrying next pass`)
       await setStatus(pr.head.sha, 'pending', `Next to merge: GitHub refused the merge, retrying (${error.status})`)
-      return false
+      return 'waiting'
     }
     throw error
   }
-  if (DRY_RUN) return false
+  if (DRY_RUN) return 'waiting'
   await removeLabel(number, ACTIVE)
   await removeLabel(number, LABEL)
   await setStatus(pr.head.sha, 'success', `Merged into ${pr.base.ref}`)
   await comment(number, `Merged by the merge queue at ${short(pr.head.sha)} (\`${CHECK}\` green, up to date with \`${pr.base.ref}\`).`)
-  return true
+  return 'merged'
 }
 
 async function pass (base) {
   const queue = await readQueue(base)
   if (!queue.length) { console.log('Queue is empty'); return false }
-  console.log('Queue:', queue.map((entry, index) => `${index + 1}. #${entry.pr.number} ${entry.test.state}${entry.active ? ' (active)' : ''}`).join(', '))
-
-  // The active PR keeps its turn until it merges or leaves; otherwise the first green one goes.
-  const head = queue.find(entry => entry.active) || queue.find(entry => entry.test.state === 'green' && !entry.pr.draft)
+  console.log('Queue:', queue.map((entry, index) => `${index + 1}. #${entry.pr.number}${entry.active ? ' (active)' : ''}`).join(', '))
   for (const [index, entry] of queue.entries()) {
-    if (entry === head) continue
-    const waiting = entry.pr.draft ? 'waiting for ready for review' : entry.test.state === 'green' ? 'waiting for its turn' : 'waiting for test'
-    await setStatus(entry.pr.head.sha, 'pending', `In queue #${index + 1}: ${waiting}`)
+    if (index > 0) await setStatus(entry.pr.head.sha, 'pending', `In queue #${index + 1}: waiting for its turn`)
   }
-  if (!head) return false
-  return advance(head)
+  for (const entry of queue) {
+    const result = await advance(entry)
+    if (result !== 'skip') return result === 'merged'
+  }
+  return false
 }
 
 async function main () {
