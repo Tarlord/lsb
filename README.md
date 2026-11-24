@@ -1,4 +1,4 @@
-# LSB R3
+# lsb · round 3
 
 lsb stands for "live stream browser"
 
