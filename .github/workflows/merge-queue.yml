@@ -1,0 +1,51 @@
+name: Merge queue
+
+# Every run is one idempotent pass over the whole queue; state lives in labels,
+# PRs and check runs, so a skipped or replaced run loses nothing.
+on:
+  pull_request_target:
+    types: [labeled, unlabeled, synchronize, ready_for_review, converted_to_draft, reopened, closed]
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+  push:
+    branches: [master]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log decisions without writing anything
+        type: boolean
+        default: false
+
+concurrency:
+  group: merge-queue
+  cancel-in-progress: false
+
+permissions:
+  actions: write        # dispatch Test after updating a branch
+  checks: read
+  contents: write       # update-branch and merge
+  issues: write         # labels and comments
+  pull-requests: write
+  statuses: write       # merge-queue position status
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Always the trusted default branch, never PR code.
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          persist-credentials: false
+          sparse-checkout: .github/merge-queue
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node .github/merge-queue/queue.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}

@@ -1,0 +1,34 @@
+name: Test
+
+# Fake CI for the merge-queue experiment: waits a random 1–4 minutes,
+# fails when a file named FAIL exists in the repository root.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # The queue bot dispatches this after it updates a branch: pushes made with
+  # the built-in token do not start pull_request runs.
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fake test
+        run: |
+          secs=$(( 60 + RANDOM % 181 ))
+          echo "Testing $(git rev-parse HEAD) for ${secs}s"
+          sleep "$secs"
+          if [ -f FAIL ]; then echo "FAIL file present"; exit 1; fi
+          echo "ok"
