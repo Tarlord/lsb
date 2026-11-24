@@ -1,4 +1,4 @@
-# lsb (live stream browser)
+# LSB round two
 
 lsb stands for "live stream browser"
 
