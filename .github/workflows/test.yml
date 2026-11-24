@@ -1,7 +1,7 @@
 name: Test
 
 # Fake CI for the merge-queue experiment: waits a random 1–4 minutes,
-# fails when a file named FAIL exists in the repository root.
+# fails when a file named FAIL exists, or when both half-a and half-b exist.
 on:
   # PR validation (on lms: source checks).
   pull_request:
@@ -34,6 +34,8 @@ jobs:
           echo "Testing $(git rev-parse HEAD) for ${secs}s"
           sleep "$secs"
           if [ -f FAIL ]; then echo "FAIL file present"; exit 1; fi
+          # Passes on each PR alone, fails once both are on master + PR.
+          if [ -f half-a ] && [ -f half-b ]; then echo "half-a and half-b together"; exit 1; fi
           echo "ok"
 
   # Start a merge-queue pass when a queue candidate finished, or when a PR that has
