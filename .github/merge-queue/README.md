@@ -1,20 +1,43 @@
-# Merge-queue experiment
+# Merge-queue experiment (full plan)
 
-A label-driven merge queue built only from GitHub Actions and the built-in token.
+GitHub-merge-queue behaviour built from GitHub Actions: the queue tests "master + PR" on a
+temporary commit and fast-forwards `master` to exactly that commit when it is green.
 
-1. A PR is in the queue only while it has the `queue` label **and** `test` is green on its
-   latest commit. Its position is the moment both became true.
-2. A red `test` or a conflict keeps the label: the bot comments once and the PR waits for
-   a fix, then rejoins at the back when `test` is green again.
+## Rules
+
+1. A PR is in the queue while it has the `queue` label **and** `test` is green on its latest
+   commit. Its position is the moment both became true.
+2. A red PR test, a conflict or a failed queue test keeps the label: the bot comments once
+   and the PR waits for a fix (a new commit, or re-adding the label to retry).
 3. The label can be added at any time, also while `test` is still running.
 
-The first PR in the queue is merged when it is up to date with `master`. If it is behind,
-the bot updates the branch (label `queue:active`), waits for the new `test`, then merges.
-Removing the label is the only way to leave the queue. The `merge-queue` commit status
-shows each queued PR's position.
+Removing the label is the only way to leave the queue. The `merge-queue` commit status on
+the PR shows its position or state.
 
-A pass runs when the `queue` label is added or a Test run finishes (Test pings the bot),
-plus a 15-minute safety net. `master` requires `test` green on an up-to-date branch; the bot
-has no bypass.
+## Flow (one candidate at a time)
+
+1. The bot merges `master` and the first PR server-side into commit M and publishes it as
+   `mq/master/pr-<n>-<head sha>`. The release branch is not touched.
+2. Test runs on that push (on lms: the full suite).
+3. Green, and neither `master` nor the PR moved → `master` is fast-forwarded to M. GitHub
+   marks the PR merged because its head is now in `master`. Red → the PR waits for a fix.
+4. A new commit on the PR or a removed label drops the candidate (its run is cancelled).
+
+## Workflows
+
+- **Test**: PR validation, queue-candidate validation; pings the queue when it finishes.
+- **Queue label check**: when the label is added after `test` finished, starts the queue.
+- **Merge queue**: the bot. Runs only when started by the above, manually, or by a
+  15-minute safety net.
+
+## Enforcement (rulesets)
+
+- `master-checks` (no bypass): `test` required on the pushed commit, no force push, no deletion.
+- `master-queue-only` (bypass: the queue's deploy key): restrict updates, PRs required.
+- `queue-branches` (bypass: the queue's deploy key): only the queue creates, updates or
+  deletes `mq/**`.
+
+The deploy key is an environment secret (`merge-queue`, deployable from `master` only),
+so PR workflows cannot read it. On lms the queue GitHub App plays this role.
 
 `Test` is fake: it sleeps 1–4 minutes and fails when a file named `FAIL` exists.

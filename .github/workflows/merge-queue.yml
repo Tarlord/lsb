@@ -1,12 +1,11 @@
 name: Merge queue
-run-name: "Merge queue · ${{ inputs.reason || (github.event_name == 'pull_request_target' && format('labeled #{0}', github.event.pull_request.number)) || github.event_name }}"
+run-name: "Merge queue · ${{ inputs.reason || github.event_name }}"
 
-# A pass runs when the `queue` label is added or a Test run finishes (Test pings
-# this workflow), plus a 15-minute safety net. Every pass is idempotent: state
-# lives in labels, PRs and checks, so a skipped or replaced pass loses nothing.
+# Runs only when there is something to do: Test finished on a labelled PR or on a queue
+# candidate, Queue label check saw a label added after the test finished, a manual run,
+# or the 15-minute safety net. Every pass is idempotent: state lives in labels, PRs,
+# checks and mq/* branches, so a skipped or replaced pass loses nothing.
 on:
-  pull_request_target:
-    types: [labeled]
   workflow_dispatch:
     inputs:
       reason:
@@ -25,18 +24,20 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: write        # start Test after updating a branch
+  actions: write        # cancel/dispatch Test runs on candidates
   checks: read
-  contents: write       # update-branch and merge
+  contents: write       # scratch refs and server-side merges
   issues: write         # labels and comments
   pull-requests: write
-  statuses: write       # merge-queue position status
+  statuses: write       # merge-queue status on PRs
 
 jobs:
-  tick:
-    if: github.event_name != 'pull_request_target' || github.event.label.name == 'queue'
+  pass:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The deploy key (the only identity allowed to update master and mq/**) is an
+    # environment secret, available to workflows running on master only.
+    environment: merge-queue
     steps:
       # Always the trusted default branch, never PR code.
       - uses: actions/checkout@v4
@@ -50,4 +51,5 @@ jobs:
       - run: node .github/merge-queue/queue.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          MQ_DEPLOY_KEY: ${{ secrets.MQ_DEPLOY_KEY }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
