@@ -5,8 +5,7 @@ name: Test
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  # The queue bot dispatches this after it updates a branch: pushes made with
-  # the built-in token do not start pull_request runs.
+  # The queue bot starts Test after it updates a branch: its pushes start no usable run.
   workflow_dispatch:
 
 concurrency:
@@ -32,3 +31,26 @@ jobs:
           sleep "$secs"
           if [ -f FAIL ]; then echo "FAIL file present"; exit 1; fi
           echo "ok"
+
+  # Tell the merge queue a test finished on a labelled PR. Runs started by the
+  # bot's built-in token do not trigger workflow_run, so Test pings it directly.
+  notify-queue:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Start a merge-queue pass if this PR is queued
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          RESULT: ${{ needs.test.result }}
+        run: |
+          prs=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --label queue --json number --jq '.[].number')
+          if [ -z "$prs" ]; then echo "No queued PR for $BRANCH"; exit 0; fi
+          for n in $prs; do
+            gh workflow run merge-queue.yml -R "$GITHUB_REPOSITORY" --ref master -f reason="test $RESULT on #$n"
+          done
