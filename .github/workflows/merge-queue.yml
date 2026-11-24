@@ -1,12 +1,11 @@
 name: Merge queue
-run-name: "Merge queue · ${{ inputs.reason || (github.event_name == 'pull_request_target' && format('labeled #{0}', github.event.pull_request.number)) || github.event_name }}"
+run-name: "Merge queue · ${{ inputs.reason || github.event_name }}"
 
-# A pass runs when the `queue` label is added or a Test run finishes (Test pings
-# this workflow), plus a 15-minute safety net. Every pass is idempotent: state
-# lives in labels, PRs and checks, so a skipped or replaced pass loses nothing.
+# Runs only when a labelled PR has a finished test: started by Test (when it finishes
+# on a labelled PR), by Queue label check (label added after test is green), manually,
+# or by the 15-minute safety net. Every pass is idempotent: state lives in labels, PRs
+# and checks, so a skipped or replaced pass loses nothing.
 on:
-  pull_request_target:
-    types: [labeled]
   workflow_dispatch:
     inputs:
       reason:
@@ -34,7 +33,6 @@ permissions:
 
 jobs:
   tick:
-    if: github.event_name != 'pull_request_target' || github.event.label.name == 'queue'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

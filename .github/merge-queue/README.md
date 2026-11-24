@@ -13,8 +13,14 @@ the bot updates the branch (label `queue:active`), waits for the new `test`, the
 Removing the label is the only way to leave the queue. The `merge-queue` commit status
 shows each queued PR's position.
 
-A pass runs when the `queue` label is added or a Test run finishes (Test pings the bot),
-plus a 15-minute safety net. `master` requires `test` green on an up-to-date branch; the bot
-has no bypass.
+Workflows:
+- **Test** pings the queue when it finishes on a PR that has the label.
+- **Queue label check** runs when the label is added: if `test` already finished it starts
+  the queue, otherwise it exits (Test starts the queue when it finishes).
+- **Merge queue** is the bot itself; it only runs when started by one of the above, manually,
+  or by a 15-minute safety net.
+
+`master` requires `test` green on an up-to-date branch; the bot has no bypass. When GitHub
+refuses to let the bot update a branch, the PR waits for its author to merge `master` in.
 
 `Test` is fake: it sleeps 1–4 minutes and fails when a file named `FAIL` exists.

@@ -129,7 +129,7 @@ async function freshPr (number) {
 
 // Not mergeable for now: keep the label, comment once per commit, let the next PR go.
 async function waitForFix (pr, reason, hint) {
-  await removeLabel(pr.number, ACTIVE)
+  if (pr.labels.some(label => label.name === ACTIVE)) await removeLabel(pr.number, ACTIVE)
   const changed = await setStatus(pr.head.sha, 'failure', `Waiting for a fix: ${reason}`)
   if (changed) await comment(pr.number, `Merge queue: ${reason} on ${short(pr.head.sha)}. ${hint}\n\nThe PR keeps its \`${LABEL}\` label and rejoins the queue when \`${CHECK}\` is green again.`)
 }
@@ -159,7 +159,7 @@ async function readQueue (base) {
     if (test.state === 'red') { await testFailed(pr, test); continue }
     // A commit that conflicted only rejoins with a new commit (a re-run cannot fix it).
     const last = await lastStatus(pr.head.sha)
-    if (last?.state === 'failure' && last.description.includes('conflicts')) continue
+    if (last?.state === 'failure' && /conflicts|could not update/.test(last.description)) continue
     if (pr.draft || test.state !== 'green') {
       // Labelled but not eligible yet: silent, unless it is the PR being brought up to date.
       if (active) queue.push({ pr, test, active, since: '' })
@@ -216,8 +216,17 @@ async function advance (entry) {
   if (pr.mergeable_state === 'dirty' || pr.mergeable === false) { await conflicted(pr); return 'skip' }
   if (pr.mergeable_state === 'behind') {
     if (!entry.active) await addLabel(number, ACTIVE)
-    await write(`update #${number} with ${pr.base.ref}`, () =>
-      gh('PUT', `/repos/${REPO}/pulls/${number}/update-branch`, { expected_head_sha: pr.head.sha }))
+    try {
+      await write(`update #${number} with ${pr.base.ref}`, () =>
+        gh('PUT', `/repos/${REPO}/pulls/${number}/update-branch`, { expected_head_sha: pr.head.sha }))
+    } catch (error) {
+      // 422 also covers "head moved": only a stable refusal waits for the author.
+      if (![403, 422].includes(error.status)) throw error
+      const moved = (await gh('GET', `/repos/${REPO}/pulls/${number}`)).head.sha !== pr.head.sha
+      if (moved) return 'waiting'
+      await waitForFix(pr, `the bot could not update the branch with \`${pr.base.ref}\``, `GitHub said: ${error.message.replace(/^.*?: /, '')}. Merge \`${pr.base.ref}\` into the branch yourself.`)
+      return 'skip'
+    }
     if (!DRY_RUN) await testUpdatedBranch(pr)
     return 'waiting'
   }
