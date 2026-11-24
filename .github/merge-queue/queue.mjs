@@ -83,11 +83,12 @@ async function lastStatus (sha) {
   return statuses.find(status => status.context === STATUS)
 }
 
-// Returns true when the status changed (used to comment once per commit and state).
-async function setStatus (sha, state, description, url = RUN_URL) {
+// Returns true when a status was written (used to comment once per commit and state).
+// `force` writes even an unchanged status, giving it a new timestamp.
+async function setStatus (sha, state, description, url = RUN_URL, { force = false } = {}) {
   const text = description.slice(0, 140)
   const last = await lastStatus(sha)
-  if (last?.state === state && last?.description === text) return false
+  if (!force && last?.state === state && last?.description === text) return false
   await write(`status ${short(sha)}: ${state} "${text}"`, () =>
     gh('POST', `/repos/${REPO}/statuses/${sha}`, { state, context: STATUS, description: text, ...(url ? { target_url: url } : {}) }))
   return true
@@ -169,8 +170,10 @@ const deleteRef = ref => write(`delete ${ref}`, () => {
 
 // ---------- queue ----------
 
-async function waitForFix (pr, reason, hint) {
-  const changed = await setStatus(pr.head.sha, 'failure', `Waiting for a fix: ${reason}`)
+// `attempted`: the bot just tried this commit (conflict or queue test). The new status
+// must be newer than the label, or a re-added label would retry forever.
+async function waitForFix (pr, reason, hint, { attempted = false } = {}) {
+  const changed = await setStatus(pr.head.sha, 'failure', `Waiting for a fix: ${reason}`, RUN_URL, { force: attempted })
   if (changed) await comment(pr.number, `Merge queue: ${reason} on ${short(pr.head.sha)}. ${hint}\n\nThe PR keeps its \`${LABEL}\` label and rejoins the queue when this is fixed (a new commit with a green \`${CHECK}\`, or re-adding the label to retry).`)
 }
 
@@ -262,7 +265,7 @@ async function checkCandidate (candidate, base) {
   }
   if (test.state === 'red') {
     await dropCandidate(candidate, 'queue test failed')
-    await waitForFix(pr, `queue test failed (${base} + this PR)`, `See ${test.url}.`)
+    await waitForFix(pr, `queue test failed (${base} + this PR)`, `See ${test.url}.`, { attempted: true })
     return 'dropped'
   }
   // Green: master becomes exactly the tested commit (fast-forward; rules check `test` on it).
@@ -308,7 +311,7 @@ async function startCandidate (queue, base) {
     } catch (error) {
       await gh('DELETE', `/repos/${REPO}/git/refs/heads/${scratch}`).catch(() => {})
       if (error.status !== 409) throw error
-      await waitForFix(pr, `conflicts with \`${base}\``, `Merge \`${base}\` into the branch and resolve the conflict.`)
+      await waitForFix(pr, `conflicts with \`${base}\``, `Merge \`${base}\` into the branch and resolve the conflict.`, { attempted: true })
       continue
     }
     if (merge.status === 204) { // nothing to merge: the PR is already in base
