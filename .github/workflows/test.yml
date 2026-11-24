@@ -5,7 +5,7 @@ name: Test
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  # Fallback for the queue bot when an updated branch got no run.
+  # The queue bot starts Test after it updates a branch: its pushes start no usable run.
   workflow_dispatch:
 
 concurrency:

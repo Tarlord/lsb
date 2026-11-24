@@ -111,8 +111,9 @@ async function testState (sha) {
   const base = { url: run.html_url, completedAt: run.completed_at }
   if (run.status !== 'completed') return { state: 'pending', ...base }
   if (run.conclusion === 'success') return { state: 'green', ...base }
-  if (run.conclusion === 'cancelled') return { state: 'missing', ...base }
-  return { state: 'red', ...base }
+  if (['failure', 'timed_out'].includes(run.conclusion)) return { state: 'red', ...base }
+  // cancelled, action_required (run awaiting approval), skipped, stale: no usable result.
+  return { state: 'missing', ...base }
 }
 
 // mergeable_state is computed lazily; poll briefly until GitHub has it.
@@ -180,13 +181,27 @@ async function clearStaleActive () {
   }
 }
 
-// The update-branch push normally starts Test by itself; dispatch only when no run showed up.
+const dispatchTest = (ref, sha) => write(`dispatch ${TEST_WORKFLOW} on ${ref} (${short(sha)})`,
+  () => gh('POST', `/repos/${REPO}/actions/workflows/${TEST_WORKFLOW}/dispatches`, { ref }))
+
+// Pushes made with the built-in token start no usable pull_request run (they need approval
+// in public repos), so the bot starts Test itself once the updated head exists.
+async function testUpdatedBranch (pr) {
+  let current = pr
+  for (let attempt = 0; attempt < 15 && current.head.sha === pr.head.sha; attempt++) {
+    await sleep(2000)
+    current = await gh('GET', `/repos/${REPO}/pulls/${pr.number}`)
+  }
+  if (current.head.sha === pr.head.sha) { console.log(`#${pr.number}: head not updated yet; a later pass starts Test`); return }
+  await dispatchTest(current.head.ref, current.head.sha)
+  await setStatus(current.head.sha, 'pending', `Next to merge: updated with ${pr.base.ref}, testing again`)
+}
+
+// Head has no usable Test run (e.g. a dispatch was lost): start one, unless the commit is brand new.
 async function ensureTestRuns (pr) {
   const { commit } = await gh('GET', `/repos/${REPO}/commits/${pr.head.sha}`)
-  const age = Date.now() - Date.parse(commit.committer.date)
-  if (age < MISSING_TEST_GRACE_MS) return
-  await write(`dispatch ${TEST_WORKFLOW} on ${pr.head.ref} (${short(pr.head.sha)})`,
-    () => gh('POST', `/repos/${REPO}/actions/workflows/${TEST_WORKFLOW}/dispatches`, { ref: pr.head.ref }))
+  if (Date.now() - Date.parse(commit.committer.date) < MISSING_TEST_GRACE_MS) return
+  await dispatchTest(pr.head.ref, pr.head.sha)
 }
 
 // Returns 'merged', 'waiting' (this PR holds the turn) or 'skip' (let the next PR go).
@@ -203,7 +218,7 @@ async function advance (entry) {
     if (!entry.active) await addLabel(number, ACTIVE)
     await write(`update #${number} with ${pr.base.ref}`, () =>
       gh('PUT', `/repos/${REPO}/pulls/${number}/update-branch`, { expected_head_sha: pr.head.sha }))
-    await setStatus(pr.head.sha, 'pending', `Next to merge: updated with ${pr.base.ref}, testing again`)
+    if (!DRY_RUN) await testUpdatedBranch(pr)
     return 'waiting'
   }
   const test = await testState(pr.head.sha)

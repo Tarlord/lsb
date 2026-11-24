@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: write        # dispatch Test when an updated branch got no run
+  actions: write        # start Test after updating a branch
   checks: read
   contents: write       # update-branch and merge
   issues: write         # labels and comments
