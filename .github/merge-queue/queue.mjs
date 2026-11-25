@@ -7,8 +7,8 @@
 // 2. A red PR test, a conflict or a failed queue test keeps the label: the bot
 //    comments once and the PR waits for a fix (a new commit, or re-adding the label).
 // 3. The label can be added at any time, also while the PR test is running.
-// 4. `queue:priority` works like `queue` and puts the PR ahead of PRs without it.
-//    It does not interrupt the candidate being tested.
+// 4. `queue:priority` works like `queue` and puts the PR ahead of PRs without it. Like
+//    jumping GitHub's queue, it interrupts a candidate without it (tested again after).
 //
 // One candidate at a time: the bot merges master and the first PR server-side into
 // commit M, publishes it as mq/<base>/pr-<n>-<head sha> (Test runs on that push), and
@@ -231,6 +231,13 @@ async function readQueue (base) {
   return queue
 }
 
+// A priority PR at the head of the queue interrupts a candidate whose PR is not priority.
+function preempts (queue, candidateNumber) {
+  const head = queue[0]
+  if (!head?.priority || head.pr.number === candidateNumber) return false
+  return !queue.some(entry => entry.pr.number === candidateNumber && entry.priority)
+}
+
 async function readCandidates (base) {
   const refs = await get(`/repos/${REPO}/git/matching-refs/heads/mq/${base}/`)
   const candidates = []
@@ -359,7 +366,11 @@ async function pass (base) {
   console.log(`Queue: ${queue.map(entry => `#${entry.pr.number}`).join(', ') || 'empty'}; testing: ${candidates.map(c => `#${c.number} (${short(c.sha)})`).join(', ') || 'none'}`)
   // One candidate at a time; extra ones (from a crash) are dropped.
   for (const extra of candidates.slice(1)) await dropCandidate(extra, 'more than one candidate')
-  const candidate = candidates[0]
+  let candidate = candidates[0]
+  if (candidate && preempts(queue, candidate.number)) {
+    await dropCandidate(candidate, `priority PR #${queue[0].pr.number} jumps the queue`)
+    candidate = null
+  }
   if (candidate) {
     const result = await checkCandidate(candidate, base)
     if (result === 'merged') return true
