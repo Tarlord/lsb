@@ -7,6 +7,8 @@
 // 2. A red PR test, a conflict or a failed queue test keeps the label: the bot
 //    comments once and the PR waits for a fix (a new commit, or re-adding the label).
 // 3. The label can be added at any time, also while the PR test is running.
+// 4. `queue:priority` works like `queue` and puts the PR ahead of PRs without it.
+//    It does not interrupt the candidate being tested.
 //
 // One candidate at a time: the bot merges master and the first PR server-side into
 // commit M, publishes it as mq/<base>/pr-<n>-<head sha> (Test runs on that push), and
@@ -27,6 +29,10 @@ const DRY_RUN = process.env.DRY_RUN === 'true'
 const RUN_URL = process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_SERVER_URL}/${REPO}/actions/runs/${process.env.GITHUB_RUN_ID}` : ''
 
 const LABEL = 'queue'
+const PRIORITY = 'queue:priority'
+const QUEUE_LABELS = [LABEL, PRIORITY]
+const hasLabel = (pr, name) => pr.labels.some(label => label.name === name)
+const inQueue = pr => QUEUE_LABELS.some(name => hasLabel(pr, name))
 const CHECK = 'test'
 const TEST_WORKFLOW = 'test.yml'
 const STATUS = 'merge-queue'
@@ -99,14 +105,19 @@ async function setStatus (sha, state, description, url = RUN_URL, { force = fals
   return true
 }
 
-async function labelEvent (number) {
-  let found = null
+// The latest `labeled` event of each queue label.
+async function labelEvents (number) {
+  const found = {}
   for (let page = 1; page <= 10; page++) {
     const events = await get(`/repos/${REPO}/issues/${number}/timeline?per_page=100&page=${page}`)
-    for (const event of events) if (event.event === 'labeled' && event.label?.name === LABEL) found = event
+    for (const event of events) if (event.event === 'labeled' && QUEUE_LABELS.includes(event.label?.name)) found[event.label.name] = event
     if (events.length < 100) break
   }
   return found
+}
+
+async function removeQueueLabels (pr) {
+  for (const name of QUEUE_LABELS) if (hasLabel(pr, name)) await removeLabel(pr.number, name)
 }
 
 async function canWrite (login) {
@@ -179,26 +190,34 @@ const deleteRef = ref => write(`delete ${ref}`, () => {
 // must be newer than the label, or a re-added label would retry forever.
 async function waitForFix (pr, reason, hint, { attempted = false } = {}) {
   const changed = await setStatus(pr.head.sha, 'failure', `Waiting for a fix: ${reason}`, RUN_URL, { force: attempted })
-  if (changed) await comment(pr.number, `Merge queue: ${reason} on ${short(pr.head.sha)}. ${hint}\n\nThe PR keeps its \`${LABEL}\` label and rejoins the queue when this is fixed (a new commit with a green \`${CHECK}\`, or re-adding the label to retry).`)
+  if (changed) await comment(pr.number, `Merge queue: ${reason} on ${short(pr.head.sha)}. ${hint}\n\nThe PR keeps its queue label and rejoins the queue when this is fixed (a new commit with a green \`${CHECK}\`, or re-adding the label to retry).`)
 }
 
 async function readQueue (base) {
-  const issues = await get(`/repos/${REPO}/issues?state=open&labels=${encodeURIComponent(LABEL)}&per_page=100`)
+  const numbers = new Set()
+  for (const name of QUEUE_LABELS) {
+    const issues = await get(`/repos/${REPO}/issues?state=open&labels=${encodeURIComponent(name)}&per_page=100`)
+    for (const issue of issues) if (issue.pull_request) numbers.add(issue.number)
+  }
   const queue = []
-  for (const issue of issues.filter(item => item.pull_request)) {
+  for (const number of numbers) {
     // The issues search lags behind merges and label removals: trust the PR itself.
-    const pr = await get(`/repos/${REPO}/pulls/${issue.number}`)
-    if (pr.state !== 'open' || !pr.labels.some(label => label.name === LABEL)) continue
-    const event = await labelEvent(pr.number)
-    if (pr.base.ref !== base || pr.head.repo?.full_name !== REPO || !(await canWrite(event?.actor?.login))) {
+    const pr = await get(`/repos/${REPO}/pulls/${number}`)
+    if (pr.state !== 'open' || !inQueue(pr)) continue
+    const events = await labelEvents(pr.number)
+    const present = QUEUE_LABELS.filter(name => hasLabel(pr, name)).map(name => events[name])
+    let noWrite = null
+    for (const event of present) if (!(await canWrite(event?.actor?.login))) noWrite = event
+    if (pr.base.ref !== base || pr.head.repo?.full_name !== REPO || noWrite) {
       const reason = pr.base.ref !== base
         ? `it targets \`${pr.base.ref}\`; the queue only merges into \`${base}\``
-        : pr.head.repo?.full_name !== REPO ? 'PRs from forks are not supported' : `the label was added by \`${event?.actor?.login || 'unknown'}\`, who has no write access`
-      await removeLabel(pr.number, LABEL)
+        : pr.head.repo?.full_name !== REPO ? 'PRs from forks are not supported' : `\`${noWrite?.label?.name}\` was added by \`${noWrite?.actor?.login || 'unknown'}\`, who has no write access`
+      await removeQueueLabels(pr)
       await comment(pr.number, `Removed from the merge queue: ${reason}.`)
       continue
     }
-    const labeledAt = event?.created_at || issue.created_at
+    // Re-adding either label retries; the position counts from the latest one.
+    const labeledAt = present.map(event => event?.created_at || pr.created_at).sort().at(-1)
     const last = await lastStatus(pr.head.sha)
     // Conflict or failed queue test on this commit: out until a new commit or a re-added label.
     if (last?.state === 'failure' && NEEDS_FIX.test(last.description) && last.created_at > labeledAt) continue
@@ -206,9 +225,9 @@ async function readQueue (base) {
     if (test.state === 'red') { await waitForFix(pr, `\`${CHECK}\` failed`, `See ${test.url}.`); continue }
     if (pr.draft || test.state !== 'green') continue // labelled, not eligible yet: silent
     const since = labeledAt > test.completedAt ? labeledAt : test.completedAt
-    queue.push({ pr, since })
+    queue.push({ pr, since, priority: hasLabel(pr, PRIORITY) })
   }
-  queue.sort((a, b) => a.since.localeCompare(b.since) || a.pr.number - b.pr.number)
+  queue.sort((a, b) => (b.priority - a.priority) || a.since.localeCompare(b.since) || a.pr.number - b.pr.number)
   return queue
 }
 
@@ -244,8 +263,7 @@ async function dropCandidate (candidate, why) {
 async function checkCandidate (candidate, base) {
   const pr = await get(`/repos/${REPO}/pulls/${candidate.number}`)
   const masterSha = await branchSha(base)
-  const labelled = pr.labels.some(label => label.name === LABEL)
-  if (pr.state !== 'open' || !labelled) { await dropCandidate(candidate, 'PR closed or label removed'); return 'dropped' }
+  if (pr.state !== 'open' || !inQueue(pr)) { await dropCandidate(candidate, 'PR closed or label removed'); return 'dropped' }
   if (pr.head.sha !== candidate.headSha) {
     await dropCandidate(candidate, 'PR has a new commit')
     await comment(pr.number, `Merge queue: the PR got a new commit (${short(pr.head.sha)}) while ${short(candidate.headSha)} was being tested. It rejoins the queue when \`${CHECK}\` is green on the new commit.`)
@@ -288,7 +306,7 @@ async function checkCandidate (candidate, base) {
     await sleep(2000)
     merged = (await get(`/repos/${REPO}/pulls/${pr.number}`)).merged
   }
-  await removeLabel(pr.number, LABEL)
+  await removeQueueLabels(pr)
   await setStatus(pr.head.sha, 'success', `Merged: ${base} is now ${short(candidate.sha)}`)
   await comment(pr.number, merged
     ? `Merged by the merge queue: \`${base}\` was fast-forwarded to ${candidate.sha}, the commit that passed \`${CHECK}\`.`
@@ -328,7 +346,7 @@ async function startCandidate (queue, base) {
     await gh('DELETE', `/repos/${REPO}/git/refs/heads/${scratch}`).catch(() => {})
     await setStatus(pr.head.sha, 'pending', `Testing in the queue: ${base} + this PR (${short(merge.data.sha)})`)
     for (const [position, other] of queue.entries()) {
-      if (position > index) await setStatus(other.pr.head.sha, 'pending', `In queue #${position - index + 1}: waiting for its turn`)
+      if (position > index) await setStatus(other.pr.head.sha, 'pending', `In queue #${position - index + 1}${other.priority ? " (priority)" : ""}: waiting for its turn`)
     }
     return true
   }
@@ -347,7 +365,7 @@ async function pass (base) {
     if (result === 'merged') return true
     if (result === 'waiting') {
       for (const [index, entry] of queue.filter(item => item.pr.number !== candidate.number).entries()) {
-        await setStatus(entry.pr.head.sha, 'pending', `In queue #${index + 2}: waiting for its turn`)
+        await setStatus(entry.pr.head.sha, 'pending', `In queue #${index + 2}${entry.priority ? " (priority)" : ""}: waiting for its turn`)
       }
       return false
     }

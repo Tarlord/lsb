@@ -1,7 +1,7 @@
 name: Queue label check
 run-name: "Queue label check · #${{ github.event.pull_request.number }}"
 
-# When `queue` is added to a PR whose test already finished, start a merge-queue pass.
+# When `queue` or `queue:priority` is added to a PR whose test already finished, start a merge-queue pass.
 # While test is still running this exits: Test starts the queue when it finishes.
 on:
   pull_request_target:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   check:
-    if: github.event.label.name == 'queue'
+    if: github.event.label.name == 'queue' || github.event.label.name == 'queue:priority'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:

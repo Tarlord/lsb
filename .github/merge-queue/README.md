@@ -11,7 +11,11 @@ temporary commit and fast-forwards `master` to exactly that commit when it is gr
    and the PR waits for a fix (a new commit, or re-adding the label to retry).
 3. The label can be added at any time, also while `test` is still running.
 
-Removing the label is the only way to leave the queue. The `merge-queue` commit status on
+4. `queue:priority` works like `queue` (no need for both) and puts the PR ahead of every
+   PR without it, once its `test` is green. Priority PRs keep their order among themselves.
+   It does not interrupt the candidate already being tested.
+
+Removing the queue labels is the only way to leave the queue. The `merge-queue` commit status on
 the PR shows its position or state.
 
 ## Flow (one candidate at a time)
