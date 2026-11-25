@@ -89,8 +89,13 @@ async function setStatus (sha, state, description, url = RUN_URL, { force = fals
   const text = description.slice(0, 140)
   const last = await lastStatus(sha)
   if (!force && last?.state === state && last?.description === text) return false
-  await write(`status ${short(sha)}: ${state} "${text}"`, () =>
+  const written = await write(`status ${short(sha)}: ${state} "${text}"`, () =>
     gh('POST', `/repos/${REPO}/statuses/${sha}`, { state, context: STATUS, description: text, ...(url ? { target_url: url } : {}) }))
+  // The statuses list lags a few seconds behind writes; readQueue must see a forced
+  // "waiting for a fix" status, or it retries the commit at once.
+  if (force && written?.data?.id) {
+    for (let i = 0; i < 15 && (await lastStatus(sha))?.id !== written.data.id; i++) await sleep(1000)
+  }
   return true
 }
 
