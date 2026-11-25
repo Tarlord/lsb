@@ -39,7 +39,7 @@ jobs:
           echo "ok"
 
   # Start a merge-queue pass when a queue candidate finished, or when a PR that has
-  # the `queue` label finished its test.
+  # a queue label (`queue` or `queue:priority`) finished its test.
   notify-queue:
     needs: test
     if: always() && needs.test.result != 'cancelled'
@@ -58,7 +58,8 @@ jobs:
           case "$BRANCH" in
             mq/*) gh workflow run merge-queue.yml -R "$GITHUB_REPOSITORY" --ref master -f reason="queue test $RESULT on ${BRANCH#mq/master/}"; exit 0 ;;
           esac
-          prs=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --label queue --json number --jq '.[].number')
+          prs=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --json number,labels \
+            --jq '.[] | select(any(.labels[]; .name == "queue" or .name == "queue:priority")) | .number')
           if [ -z "$prs" ]; then echo "No queued PR for $BRANCH"; exit 0; fi
           for n in $prs; do
             gh workflow run merge-queue.yml -R "$GITHUB_REPOSITORY" --ref master -f reason="test $RESULT on #$n"
